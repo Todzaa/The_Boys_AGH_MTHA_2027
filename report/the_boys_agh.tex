@@ -1,0 +1,464 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\setlist{itemsep=2pt,topsep=4pt,before={\interlinepenalty=10000\relax}}
+% bez pojedynczych linii na poczatku/koncu strony; punkty list nie sa dzielone miedzy strony
+\clubpenalty=10000
+\widowpenalty=10000
+\displaywidowpenalty=10000
+\raggedbottom
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{More Than a Hack 2027 -- Initial Challenge\\[4pt]
+  \large Ball possession from automatic tracking data\\[2pt]
+  \normalsize Technical report}
+\author{\textbf{``The Boys AGH''}\\[6pt]
+  Miłosz Nowak\\ Michał Mróz\\ Tymon Szyler\\ Filip Różański\\[6pt]
+  AGH University of Krakow\\
+  Faculty of Metals Engineering and Industrial Computer Science}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We label every frame of FC Barcelona -- Athletic Club as home possession (H), away possession (A) or dead ball (D)
+using only the organisers' automatic player and ball tracking (ATD). The method is a transparent, rule-based pipeline
+in NumPy and pandas, with no machine learning, no video and no GPU. It filters and smooths the ball track, assigns
+ball control to the nearest player within 2\,m when no rival is equally close, detects ball touches from changes of
+ball velocity, detects dead ball from the ball leaving (or being projected to leave) the pitch and from a collective
+drop in player speed, and tracks possession with a decaying turnover counter that ignores single touches and keeps
+loose balls with the last team in control. We validated the design choices on two public Metrica Sports matches,
+both with their original tracking and with the ball degraded to resemble ATD. On the
+original tracking our pipeline reaches a spellF1 of 0.757 and 0.768, against 0.438 and 0.415 for the organisers'
+baseline; with the ATD-like ball it reaches 0.535 and 0.517, against 0.365 and 0.327. On the public five-minute window
+of the competition match, used only as a sanity check, it reaches a spellF1 of 0.563 against the baseline's
+0.326. The whole match is labelled deterministically in under a minute on a laptop CPU.
+\end{abstract}
+
+\section{Introduction}
+The Initial Challenge of More Than a Hack 2027 asks for a frame-by-frame description of ball possession in one LaLiga
+match, FC Barcelona against Athletic Club. For each of the 199\,319 frames of the tactical video (25 frames per second)
+the submission assigns one label: H when the home team has the ball in play, A when the away team has it, D when the
+ball is dead (throw-ins, corners, fouls, goals, other stoppages), and X when no decision is made. Only frames of actual
+play are graded: 11\,185--90\,651 in the first half and 110\,808--190\,197 in the second.
+
+The organisers provide automatic player and ball tracking, Smart Tagging of tactical phases, a per-frame camera
+homography and the match videos. None of this data is corrected by hand: tracks break and swap identities, and the
+ball is missing in about 41\% of the graded frames. The task is therefore not tracking itself, but inferring possession
+from noisy positional data.
+
+The ranking metric is spellF1, which rewards recovering whole possession spells with correct boundaries and penalises
+fragmented sequences; frame-level macroF1 is used only to break ties. The organisers' baseline (nearest player to the
+ball with majority voting) reaches a spellF1 of 0.2433 on the full match.
+
+Because spellF1 counts spells and not frames, a single false H--A--H flicker splits one correct spell into three wrong
+ones. Our design therefore favours \emph{stability} over frame-level reactivity. A change of possession needs sustained
+evidence, a short spell is treated as noise, and every threshold has a physical meaning in metres, metres per second
+or seconds. We chose a rule-based approach over a learned model for three reasons. The rules forbid labels from the
+provided match. Public frame-level possession labels for other matches are scarce. And with a short validation
+budget, explicit rules are easier to check, debug and explain than a model.
+
+\section{Data}
+\label{sec:data}
+
+\paragraph{Used: automatic tracking data (ATD).}
+We read the ATD text file and its XML metadata into dense arrays: positions of all player slots in metres (normalised
+coordinates times $105.3\times68$\,m), the per-player speed channel, and the ball position. The team of each slot comes
+from the XML (the first team in the file is the home team, H). Slots whose team identifier belongs to neither team,
+such as referees, are excluded from all distance computations. Frame indices follow the organisers' convention
+(\code{frame\_id} $=$ video frame $+1$). On the graded frames the ball is present in 59.3\% of frames, and our jump
+filter removes 178 observations.
+
+Two aggregate properties of the ATD ball shaped our method. Its track is strongly smoothed: velocity changes of at
+least 5\,m/s within 3 frames occur 82 times in the whole match, against about 1\,700 per match on Metrica. And it lies
+farther from the players: the median distance from the ball to the nearest player is 1.9\,m, against 0.3\,m on
+Metrica. We therefore detect touches over longer windows (Section~\ref{sec:control}) and validate on Metrica with the
+ball degraded to match these statistics (Section~\ref{sec:results}).
+
+\paragraph{Used only as a sanity check: public ground truth.}
+The organisers publish ground truth for one five-minute window (frames 11\,185--18\,684, 17 spells). We used it only
+to confirm that the pipeline output is well formed and of the expected order of magnitude. It was printed by
+\code{run\_match.py} during the control-margin sweep (Section~\ref{sec:training}), but we did not use it to choose
+between variants or to set thresholds. With 17 spells, one spell moves spellF1 by about 0.06, so the window cannot
+separate variants anyway.
+
+\paragraph{Evaluated but not used.}
+\begin{itemize}
+  \item \textbf{Smart Tagging.} The 59 set pieces mark restarts and so the end of dead-ball periods. We estimated an
+    upper bound for this signal on Metrica (Section~\ref{sec:rejected}). Even perfect restart times and teams at
+    60\% coverage raised spellF1 by only about 0.02. Real automatic tags have timing errors and no team for throw-ins,
+    so we judged the risk of a late change larger than the gain.
+  \item \textbf{Homography and video.} We ran the YOLOv8 ball detector of our separate computer-vision project on every
+    second frame of the tactical video and projected the detections to the pitch with the organisers' homography.
+    Using the video ball instead of, or in addition to, the ATD ball raised ball coverage on graded frames from 59\%
+    to 72\% and 79\%, but the median distance from the ball to the nearest player stayed at 1.8--1.9\,m and the file
+    had more, shorter spells (321--327 against 298). The main diagnostic did not improve, and the run needs a GPU,
+    model weights and about 1.5\,h, so the submission stays ATD-only and CPU-only. The unchanged ball--player distance
+    also suggests that the offset comes from the player positions or their reference point, not from the ball track.
+\end{itemize}
+
+\section{Method}
+The pipeline (\code{run\_match.py}, modules in \code{geo/}) processes the whole match in six steps. All thresholds
+live in a single file, \code{geo/config.py}.
+
+\subsection{Ball control}
+\label{sec:control}
+\begin{enumerate}
+  \item \textbf{Ball filtering.} A short stretch of the ball track (fewer than 3 frames) that is cut off from its
+    neighbours by a jump faster than 45\,m/s (plus a 1\,m tolerance) is treated as a tracking error and skipped. The
+    hardest shots reach about 35\,m/s, so real kicks are kept. The filter runs twice, because removing one spike can
+    reconnect its neighbours. The remaining track is smoothed with a rolling median over $\pm2$ frames, and gaps of up
+    to 10 frames (0.4\,s) between trusted observations are interpolated linearly.
+  \item \textbf{Team distances.} For each frame we compute the distance from the ball to the nearest home player and
+    to the nearest away player. The distance is infinite when the ball or a team is missing.
+  \item \textbf{Control.} A team controls the ball in a frame when its nearest player lies within $R=2$\,m of the ball,
+    the nearest rival is at least 0.2\,m farther, \emph{and} the ball is not passing by faster than 12\,m/s (median of
+    the ball speed over $\pm2$ frames). In every other case nobody controls the ball: loose ball, contested ball, ball
+    in flight, or no data. On the competition match the control condition holds in 29.0\% of the frames of play.
+  \item \textbf{Touches.} A touch is a change of the ball velocity vector of at least 3\,m/s between the 12 frames
+    (0.48\,s) before and after a frame, at a local peak of that change, with one team's nearest player within 3.5\,m
+    and the nearest rival at least 0.5\,m farther. The long window and the large radius follow from the smoothed and
+    offset ATD ball (Section~\ref{sec:data}); they were chosen on ATD-like Metrica (Section~\ref{sec:training}).
+\end{enumerate}
+
+\subsection{Dead-ball detection}
+A frame is dead (D) when one of three detectors fires:
+\begin{enumerate}
+  \item \textbf{Ball out of play.} The ball is more than 0.5\,m beyond a touchline or goal line. The frame stays dead
+    until the ball is observed back on the pitch, including frames where the ball is missing in between (a throw-in
+    is often taken while the ball is not tracked).
+  \item \textbf{Projected exit.} When the ball disappears while moving faster than 3\,m/s towards a line, stays missing
+    for at least 2\,s, and its next observation lies within 6\,m of that line or beyond the pitch, we extrapolate its
+    last velocity for at most 1\,s and mark D from the predicted crossing.
+  \item \textbf{Low collective activity.} The median speed of the tracked players, smoothed with a $\pm1$\,s rolling
+    median, stays below 1.1\,m/s for at least 3\,s. Such a stretch is extended in both directions while the smoothed
+    activity stays below 1.7\,m/s, because players slow down gradually and the strict threshold alone fires late.
+    A trusted ball rolling faster than 2\,m/s marks play, not a stoppage.
+\end{enumerate}
+Gaps shorter than 1\,s between low-activity periods are closed, and a fragment of live play shorter than 2\,s between
+two dead-ball periods of any kind is also D, so that no micro-spell remains between two stoppages. All frames between
+the start of grading and the second-half kick-off are D.
+
+\subsection{Possession tracking}
+Within each continuous stretch of live play we track the team in possession with a decaying turnover counter. The idea
+comes from the \code{PossessionTracker} in Michał Mróz's engineering thesis (a football analytics system for the
+Wisła Kraków academy), adapted here to metric ATD distances.
+\begin{itemize}
+  \item The first team in control after a restart opens the stretch, and its possession is backfilled to the restart.
+  \item Each frame controlled by the rival adds $+1$ to the counter, each frame controlled by the holder adds $-1$
+    (never below zero), and frames without control leave it unchanged. When the counter reaches 13 frames (0.5\,s),
+    possession changes. The change is dated back to the frame in which the rival's advantage began, not the frame in
+    which the threshold was crossed.
+  \item Two touches by the rival within 3\,s, with no touch by the holder in between (for example an interception
+    followed by a pass), also change possession, dated from the first of them. A single rival touch, such as a
+    deflection, changes nothing.
+  \item A stretch of live play with no control at all inherits the team of the previous stretch.
+  \item A spell shorter than 2\,s inside a stretch reverts to the previous team: the rival did not keep the ball, so
+    the change was not a controlled turnover. A spell shorter than 2\,s at the very start of a stretch is given to the
+    next team instead, which removes micro-spells caused by a rival standing closest to the ball at a restart.
+\end{itemize}
+
+\subsection{Composing the submission}
+Frames outside the two halves get X. Graded frames never get X, because the scorer counts X as an error in macroF1.
+Dead ball gives D, and a graded live frame with no possession evidence at all also gives D (0.0\% of graded frames on
+the competition match). The labels are computed twice and the run is accepted only if the SHA-256 hashes of both
+outputs are identical. The final file is then checked with the organisers' \code{validate\_submission.py}.
+
+\subsection{Possession rules in brief}
+\label{sec:rules}
+\begin{center}
+\small
+{\renewcommand{\arraystretch}{1.3}
+\begin{tabularx}{\textwidth}{|p{0.30\textwidth}|X|}
+\hline
+\textbf{Situation} & \textbf{Rule implemented} \\
+\hline
+Loose ball, ball in flight & No team in control. Possession stays with the last team, and the turnover counter is
+  frozen. \\
+\hline
+Challenge, deflection, scramble & A single touch by the rival changes nothing, and a ball with both teams equally
+  close is contested (no control). A turnover needs 0.5\,s of net control advantage or two rival touches within 3\,s,
+  and the rival must then keep the ball for 2\,s. \\
+\hline
+Interception that leads to a real spell & Possession changes, dated from the first frame of the rival's advantage or
+  from its first touch. \\
+\hline
+Long pass or cross & Ball in flight, so the passing team keeps possession until a receiver gains control. \\
+\hline
+Goalkeeper holding the ball & Ordinary control by the goalkeeper's team. \\
+\hline
+Ball out of play & D from the moment the ball is 0.5\,m beyond the line (or from its projected crossing, when it
+  disappears on the way out) until it is back on the pitch. \\
+\hline
+Foul, injury, VAR, other stoppage & D when the players' median speed stays below 1.1\,m/s for $\ge$3\,s. Shorter
+  stoppages remain play. \\
+\hline
+Restart (any set piece) & D ends when the ball is back on the pitch or play resumes. The first team in control takes
+  possession. Laws of the game (e.g.\ the corner goes to the non-touching team) are \emph{not} modelled. \\
+\hline
+Before kick-off of the 2nd half & D on all graded frames. \\
+\hline
+\end{tabularx}}
+\end{center}
+
+\section{Training data}
+\label{sec:training}
+The pipeline contains \textbf{no learned model} and uses no training data. Labelled data was used only for validation
+and for setting a few thresholds:
+\begin{itemize}
+  \item \textbf{Metrica Sports Sample Games 1 and 2}
+    (\url{https://github.com/metrica-sports/sample-data}). These are two anonymised professional matches, \emph{not}
+    the provided match, with player and ball tracking at 25\,fps and synchronised event data annotated manually by
+    Metrica Sports. Together they give about 282\,000 graded frames and 504 reference possession spells.
+  \item \textbf{How we turned events into H/A/D labels} (\code{geo/metrica.py}). We did this mechanically, with no
+    manual labelling by our team:
+    \begin{itemize}
+      \item Possession belongs to the team of the last on-ball event (pass, recovery, set piece, shot, ball lost, ball
+        out). Challenges, fouls and cards do not change it.
+      \item A turnover counts only if it is controlled: the new team passes or shoots, or keeps the ball for at least
+        3\,s. We chose the 3\,s value so that the mean spell length of the reference ($\approx$14\,s) matches the
+        published mean of the organisers' public window (14.2\,s). This affects the validation reference, not the
+        pipeline.
+      \item D runs from the end of the last event before a restart to the restart.
+    \end{itemize}
+    The result is an approximation of the organisers' ground truth, which is derived from corrected tracking.
+  \item \textbf{ATD-like Metrica} (\code{metrica.atd\_like}). A copy of each Metrica match in which the ball track is
+    smoothed with a 25-frame moving average and shifted by a slowly varying random offset (white noise smoothed twice
+    over 10\,s, scaled to 1\,m), with four fixed seeds per match. This reproduces the two ATD statistics of
+    Section~\ref{sec:data}: the median ball--player distance becomes 1.9\,m and 53\% of balls lie within 2\,m of a
+    player (ATD 52.5\%).
+  \item \textbf{Tuned on Metrica:} the ball-speed limit for control (12\,m/s), the minimum spell length (2\,s), the
+    out-of-play margin (0.5\,m), the activity extension threshold (1.7\,m/s) and the rolling-ball threshold
+    (2\,m/s) on the original tracking; the touch window, radius and velocity threshold (12 frames, 3.5\,m, 3\,m/s) as
+    the best of 24 settings on ATD-like Metrica (\code{python validate\_metrica.py --sweep --atd-like}). The ball
+    smoothing, the 0.4\,s gap filling and the projected exit were checked on Metrica. The control margin was chosen on
+    Metrica by a sweep over 0--0.6\,m in steps of 0.05\,m; all values lie within the noise level of each other, and we
+    kept 0.2\,m. For each value we also ran \code{run\_match.py} to check that the full-match file stayed valid; its
+    output includes the public-window sanity check, but the choice was based on Metrica alone. The remaining
+    thresholds (for example the 45\,m/s ball-jump limit, the 2\,m control radius and the 13-frame turnover counter)
+    come from physical reasoning or from our earlier projects.
+\end{itemize}
+No labels from the provided match were used for training, tuning or model selection, and the private ground truth
+was never used.
+
+\section{Results}
+\label{sec:results}
+
+\paragraph{Validation on Metrica.}
+Table~\ref{tab:metrica} uses the organisers' scorer (\code{possession\_metrics.py}). Our pipeline beats the baseline
+on every metric. spellF1 improves by about 0.33, several times the noise level that the organisers quote. The number
+of predicted spells is close to the reference, whereas the baseline predicts almost twice too many.
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Validation on the two public Metrica matches with their original tracking (reference built from events,
+Section~\ref{sec:training}).}
+\label{tab:metrica}
+{\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{|l|l|c|c|c|c|c|}
+\hline
+\textbf{Match} & \textbf{Method} & \textbf{spellF1} & \textbf{macroF1} & \textbf{live/dead F1} & \textbf{spells (ref.)} & \textbf{mean [s] (ref.)} \\
+\hline
+1 & ours     & \textbf{0.757} & \textbf{0.879} & \textbf{0.929} & 237 (260) & 14.0 (13.5) \\
+\hline
+1 & baseline & 0.438 & 0.785 & 0.896 & 479 (260) & 8.2 (13.5) \\
+\hline
+2 & ours     & \textbf{0.768} & \textbf{0.909} & \textbf{0.953} & 227 (244) & 14.9 (14.3) \\
+\hline
+2 & baseline & 0.415 & 0.831 & 0.925 & 464 (244) & 8.0 (14.3) \\
+\hline
+\end{tabular}}
+\end{table}
+
+\paragraph{Stress test: ATD-like ball.}
+Table~\ref{tab:stress} repeats the validation with the ATD-like ball (Section~\ref{sec:training}), averaged over four
+seeds. spellF1 drops by about 0.24 for our pipeline and by about 0.08 for the baseline, but ours still leads by about
+0.18, live/dead F1 stays at 0.93, and the number of spells stays close to the reference (265 and 263 against 260 and
+244). The loss comes mainly from turnover boundaries: the F1 of possession transitions falls from 0.73 to about
+0.48, while live/dead F1 does not change. Touch detection raises the mean spellF1 from 0.744 to 0.762 on the original tracking and
+from 0.514 to 0.526 on the ATD-like ball.
+
+\begin{table}[ht]
+\centering
+\small
+\caption{spellF1 on Metrica with the original and the ATD-like ball (mean of 4 seeds).}
+\label{tab:stress}
+{\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+ & \multicolumn{2}{c|}{\textbf{ours}} & \multicolumn{2}{c|}{\textbf{baseline}} \\
+\cline{2-5}
+\textbf{Match} & \textbf{original} & \textbf{ATD-like} & \textbf{original} & \textbf{ATD-like} \\
+\hline
+1 & 0.757 & 0.535 & 0.438 & 0.365 \\
+\hline
+2 & 0.768 & 0.517 & 0.415 & 0.327 \\
+\hline
+\end{tabular}}
+\end{table}
+
+\paragraph{Competition match.}
+Table~\ref{tab:match} shows the sanity check on the public window and summary statistics of the submitted file. The
+file passes the organisers' validator and is reproduced bit-for-bit. The submitted file contains 298 spells with a mean
+length of 13.5\,s, and 36.5\% of graded frames are D.
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Competition match: public five-minute window (sanity check only) and the full submitted file.}
+\label{tab:match}
+{\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+\textbf{Public window} & \textbf{spellF1} & \textbf{macroF1} & \textbf{spells} & \textbf{mean spell [s]} \\
+\hline
+ours            & \textbf{0.563} & \textbf{0.703} & 15 & 18.8 \\
+\hline
+baseline        & 0.326 & 0.621 & 26 & 10.8 \\
+\hline
+ground truth    & --    & --    & 17 & 14.2 \\
+\hline
+\end{tabular}}
+
+\smallskip
+Full match, graded frames: H 35.8\,\%, A 27.6\,\%, D 36.5\,\%, X 0.0\,\%; 298 spells, mean 13.5\,s;
+SHA-256 \code{36ed44ba1f6d\ldots}
+\end{table}
+
+\subsection{What we tried and dropped}
+\label{sec:rejected}
+Each idea was implemented and scored on both Metrica matches. The organisers estimate the noise level of spellF1 at
+about 0.04, and none of the ideas below exceeded it.
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Change in mean Metrica spellF1 for each idea. Rows marked $^*$ were measured on an earlier version of the
+pipeline (before ball smoothing and touches), with the original ball / with 41\% of the ball removed at random during
+play.}
+\label{tab:rejected}
+{\renewcommand{\arraystretch}{1.3}
+\begin{tabularx}{\textwidth}{|X|c|l|}
+\hline
+\textbf{Idea} & \textbf{$\Delta$ spellF1} & \textbf{Decision} \\
+\hline
+Grid of turnover threshold (10--17 frames) $\times$ minimum spell (1.5--2.5\,s), and of the dead-ball thresholds$^*$ &
+  $\le 0$ / within noise & keep current \\
+\hline
+Viterbi decoding of H/A per live stretch (switch penalty 6--45 frames), with switches snapped to the rival's first
+  control$^*$ & $-0.016$ / $-0.012$ & dropped \\
+\hline
+Control \emph{only} on a detected touch, replacing the distance rule (after Vidal-Codina et al.\ 2022)$^*$ &
+  $\approx 0$ / $-0.03$ & dropped \\
+\hline
+Linear interpolation of the ball across long gaps (up to 2\,s)$^*$ & $+0.001$ / $+0.003$ & dropped (0.4\,s kept) \\
+\hline
+Team shape when the ball is missing (more spread-out team in possession; 77--79\% accurate on its own)$^*$ &
+  $+0.009$ / $0.000$ & dropped \\
+\hline
+``Stationary ball $\ge$1\,s $=$ stoppage'' for quick free kicks$^*$ & as many false alarms as hits & dropped \\
+\hline
+Removing dead-ball fragments shorter than 0.2--2\,s$^*$ & $\le 0.005$ & dropped \\
+\hline
+Upper bound of Smart Tagging: perfect restart frames and teams at 60\% coverage$^*$ & $+0.02$ / $+0.024$ & not worth
+  the risk \\
+\hline
+Capping out-of-play D at 45--60\,s (30\,s and less is harmful)$^*$ & $0.000$ / $0.000$ & not needed on Metrica \\
+\hline
+\textbf{Adopted:} two rival touches within 3\,s as additional turnover evidence (original / ATD-like ball) &
+  $+0.019$ / $+0.012$ & \textbf{kept} \\
+\hline
+\textbf{Adopted:} short first spell after a restart given to the next team, and gap closing on the union of the
+  dead-ball detectors$^*$ & $+0.003$ / $+0.007$ & \textbf{kept} (bug fixes) \\
+\hline
+\end{tabularx}}
+\end{table}
+
+\section{Limitations}
+\label{sec:limitations}
+\begin{itemize}
+  \item \textbf{Turnovers while the ball is missing or offset.} This is the main weakness. When the ball disappears
+    during a duel and reappears with the other team, or lies between players, we often miss the change or date it
+    late. The ATD-like stress test shows the effect (Table~\ref{tab:stress}), and so does the public window, where we
+    predict 15 spells of 18.8\,s against 17 spells of 14.2\,s. Touch detection recovers part of these turnovers, but
+    geometry of the players alone did not (Table~\ref{tab:rejected}).
+  \item \textbf{Short stoppages.} On Metrica we miss 10--12 whole stoppages per match, mostly quick free kicks after
+    fouls, where players keep moving and the ball stays on the pitch. Stoppages shorter than 3\,s are never D.
+  \item \textbf{Restart rules are not modelled.} The team that restarts is simply the first one in control. A rival
+    standing closest to the ball at a throw-in can win a short spell, although the minimum-spell rule removes most of
+    these cases.
+  \item \textbf{Nearest player in crowds.} In a crowded penalty area the nearest player is not necessarily the one
+    playing the ball. Ball height is not used to rule out headers and aerial balls passing over a player.
+  \item \textbf{Tracking errors.} Identity swaps, a second ball and pitch invasions are not handled. If the ball
+    disappears after leaving the pitch, out-of-play D lasts until it is seen on the pitch again. The longest such
+    period on the competition match is 139\,s, and we could not verify whether it is a real stoppage.
+  \item \textbf{Validation gap.} Our reference is built from events and is easier than ATD: the baseline scores 0.43
+    on original Metrica and 0.35 on ATD-like Metrica, but 0.24 on the full competition match. Absolute Metrica scores
+    therefore overestimate our score on the competition match. Comparisons between variants are what we rely on.
+\end{itemize}
+
+\paragraph{With more time} we would:
+\begin{itemize}
+  \item validate on matches with ground truth of the same type as the organisers', such as the DFL/IDSSE open data,
+    which provides ball status and possession per frame;
+  \item use Smart Tagging restarts once they can be validated;
+  \item infer the ball position during gaps from player movement (e.g.\ Kim et al., KDD 2023);
+  \item find the source of the 1.9\,m ball--player offset in ATD (player reference point or projection), which video
+    ball detection did not remove (Section~\ref{sec:data}).
+\end{itemize}
+
+\section{Reproducibility}
+\label{sec:repro}
+The code is public at \url{https://github.com/Todzaa/The_Boys_AGH_MTHA_2027} and runs on any CPU with Python~3.12,
+NumPy~2.4.4 and pandas~2.3.3 (pinned in \code{requirements.txt}). No GPU, video or network access is needed at run
+time.
+
+\noindent The repository expects the following layout (paths can be overridden by environment variables):
+\begin{itemize}
+  \item the organisers' data in \code{../dane\_od\_organizatorow} (\code{MTAH\_DATA\_DIR});
+  \item the organisers' repository with the scorer in \code{../more-than-a-hack-2027} (\code{MTAH\_REPO});
+  \item for validation only, the Metrica sample data in \code{../metrica\_sample\_data} (\code{METRICA\_DIR}).
+\end{itemize}
+
+\noindent Commands:
+\begin{verbatim}
+pip install -r requirements.txt
+python -m unittest                            # unit tests on synthetic data
+python run_match.py                           # -> outputs/match/the_boys_agh.csv
+python validate_metrica.py                    # validation on the two Metrica matches
+python validate_metrica.py --atd-like         # the same with the ATD-like ball
+python validate_metrica.py --sweep --atd-like # grid used to choose the touch thresholds
+\end{verbatim}
+\code{run\_match.py} computes the labels twice and requires identical SHA-256 hashes. It then runs the organisers'
+validator and prints the public-window sanity check. All parameters are in \code{geo/config.py}. The full run takes
+under a minute on a laptop CPU; the first run also builds the ATD cache.
+
+\section*{Acknowledgements}
+We thank Metrica Sports for the challenge data and for the public sample games used for validation. The possession
+counter builds on Michał Mróz's engineering thesis at AGH. An LLM assistant was used for code review, implementation help and validation experiments on
+the public Metrica data. Only aggregate statistics of the competition match (counts, percentages, metric values) were
+shared with it; no tracking data, video or labels.
+
+\section*{References}
+\begin{itemize}[leftmargin=*]
+  \item F.~Vidal-Codina, N.~Evans, B.~El~Fakir, J.~Billingham. \emph{Automatic event detection in football using
+    tracking data}. arXiv:2202.00804, 2022.
+  \item H.~Kim et al. \emph{Ball trajectory inference from multi-agent sports contexts using set transformer and
+    hierarchical Bi-LSTM}. KDD 2023, arXiv:2306.08206.
+  \item Metrica Sports, sample data: \url{https://github.com/metrica-sports/sample-data}.
+\end{itemize}
+
+\end{document}
